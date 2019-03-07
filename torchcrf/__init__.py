@@ -183,8 +183,8 @@ class CRF(nn.Module):
 
         # Start transition score and first emission
         # shape: (batch_size,)
-        score = self.start_transitions[tags[0]]
-        score += emissions[0, torch.arange(batch_size), tags[0]]
+        score = self.start_transitions[tags[0]] # lấy ra start transition score cho từng ground-truth tags của tokens ở vị trí thứ 0.
+        score += emissions[0, torch.arange(batch_size), tags[0]] # lấy ra giá trị emissions của các ground-truth tags của các tokens ở vị trí thứ 0 ở tất cả các examples.
 
         for i in range(1, seq_length):
             # Transition score to next tag, only added if next timestep is valid (mask == 1)
@@ -198,12 +198,14 @@ class CRF(nn.Module):
         # End transition score
         # shape: (batch_size,)
         seq_ends = mask.long().sum(dim=0) - 1
+        # => mask.shape = [num tokens, batch size] => mask.sum(dim=0) sẽ tính số tokens thực sự trong mỗi example 
+        # sau đó, lấy số tokens trừ đi 1 ta thu được chỉ-số-của-token-cuối-cùng (seq_ends) trong mỗi example. 
         # shape: (batch_size,)
         last_tags = tags[seq_ends, torch.arange(batch_size)]
         # shape: (batch_size,)
         score += self.end_transitions[last_tags]
 
-        return score
+        return score # score.shape = [batch size,], each example has only one CRF score (a scalar value) 
 
     def _compute_normalizer(
             self, emissions: torch.Tensor, mask: torch.ByteTensor) -> torch.Tensor:
@@ -212,7 +214,7 @@ class CRF(nn.Module):
         assert emissions.dim() == 3 and mask.dim() == 2
         assert emissions.shape[:2] == mask.shape
         assert emissions.size(2) == self.num_tags
-        assert mask[0].all()
+        assert mask[0].all() # mask.shape = [num tokens, batch size]
 
         seq_length = emissions.size(0)
 
@@ -221,32 +223,57 @@ class CRF(nn.Module):
         # the score that the first timestep has tag j
         # shape: (batch_size, num_tags)
         score = self.start_transitions + emissions[0]
+        
+        # start_transitions, transitions, end_transitions lưu trữ các scores thể hiện các tri thức tiên nghiệm (prior-tri thức chung) 
+        # về khả năng xuất hiện của [các nhãn ở các vị trí (đầu câu-start, cuối câu-end)] hay là khả năng xuất hiện của
+        # [1 nhãn l ở vị trí từ thứ k] khi biết được nhãn của từ liền trước ở vị trí k-1
+        # --------------------
+        # còn với emissions: lưu trữ các scores thể hiện tri thức cụ thể từ dữ liệu(evidence) về khả năng xuất hiện của 
+        # các nhãn ở các vị trí đang xét. 
+        # việc cộng 3 giá trị "score", giá trị "transitions" và giá trị "emissions" giúp đánh giá chính xác nhất
+        # về khả năng xuất hiện của các nhãn ở vị trí hiện tại
+        # =>>>>>> 
+        #       - score: thể hiện khả năng xảy ra của các tag khác nhau 
 
         for i in range(1, seq_length):
             # Broadcast score for every possible next tag
             # shape: (batch_size, num_tags, 1)
-            broadcast_score = score.unsqueeze(2)
+            broadcast_score = score.unsqueeze(2) 
+            # => điểm số tích lũy được cho từng tags, mỗi điểm số của tag thứ k
+            # thể hiện cho điểm số của tag k được tích lũy qua tất cả các chuỗi có thể mà kết thúc với tag k 
+            # tiếp theo ta sẽ dùng thông tin tích lũy này để ước lượng tag tiếp theo của từng tag k là gì
+            # khi biết số điểm của tag k đó.
 
             # Broadcast emission score for every possible current tag
             # shape: (batch_size, 1, num_tags)
             broadcast_emissions = emissions[i].unsqueeze(1)
+            # => điểm số đánh giá khả năng xuất hiện của các tags ở vị trí tiếp theo (thứ i), bất kể từ thứ i-i có tag là gì.  
 
             # Compute the score tensor of size (batch_size, num_tags, num_tags) where
-            # for each sample, entry at row i and column j stores the sum of scores of all
-            # possible tag sequences so far that end with transitioning from tag i to tag j
+            # for each of 'batch_size' examples, entry at row i and column j stores the sum of scores of all
+            # possible tag sequences so far that [end with transitioning from tag i to tag j]
             # and emitting
             # shape: (batch_size, num_tags, num_tags)
             next_score = broadcast_score + self.transitions + broadcast_emissions
+            #           | điểm của tất  ||  điểm của việc  | | điểm cho khả năng  |
+            #           | cả các chuỗi  ||  chuyển tiếp từ | | xuất hiện của tag  |
+            #           | có thể có kết ||  tag thứ i sang | | j ở vị trí tiếp    |
+            #           | thúc với tag i||  tag j          | | theo               |
 
             # Sum over all possible current tags, but we're in score space, so a sum
-            # becomes a log-sum-exp: for each sample, entry i stores the sum of scores of
-            # all possible tag sequences so far, that end in tag i
+            # becomes a log-sum-exp: for each of 'batch_size' examples, entry i stores the sum of scores of
+            # all possible tag sequences (i.e., all rows in 'next_score[example]' matrix) so far, that end in tag i
             # shape: (batch_size, num_tags)
             next_score = torch.logsumexp(next_score, dim=1)
+            # tính giá trị điẻm tích lũy mới cho từng tag, 
+            # điể
 
-            # Set score to the next score if this timestep is valid (mask == 1)
+            # update điểm số (score) nếu như token thứ i vẫn tồn tại trong example ấy, i.e., số tokens của example này >= i
+            # nếu example nào đó không dài tới mức có token thứ i thì không update điểm số của example ấy nữa. 
             # shape: (batch_size, num_tags)
-            score = torch.where(mask[i].unsqueeze(1), next_score, score)
+            score = torch.where(mask[i].unsqueeze(1), next_score, score) 
+            # a = torch.where(condition, x, y), a[i] = x[i] nếu condition[i] == 1, ngược lại a[i] = y[i] 
+            # condition ở trong tình huôgs này là "example thứ i có tồn tại token thứ i (khkhông?"
 
         # End transition score
         # shape: (batch_size, num_tags)
